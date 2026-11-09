@@ -1,0 +1,245 @@
+package com.atm;
+
+import com.atm.controller.ATMController;
+import com.atm.controller.ATMController.OperationResult;
+import com.atm.dao.DatabaseConnection;
+import com.atm.model.Transaction;
+import com.atm.view.ATMMainFrame;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.List;
+
+public class Main {
+
+    public static void main(String[] args) {
+        DatabaseConnection.initializeDatabase();
+
+        if (args.length > 0 && "--self-test".equalsIgnoreCase(args[0])) {
+            runAutomatedSelfTest();
+            return;
+        }
+
+        System.setProperty("awt.useSystemAAFontSettings", "on");
+        System.setProperty("swing.aatext", "true");
+
+        SwingUtilities.invokeLater(() -> {
+            try {
+                UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName());
+            } catch (Exception ignored) {
+            }
+
+            if (GraphicsEnvironment.isHeadless()) {
+                System.out.println("Headless environment detected. Running self-test instead:");
+                runAutomatedSelfTest();
+                return;
+            }
+
+            ATMController controller = new ATMController();
+            ATMMainFrame mainFrame = new ATMMainFrame(controller);
+            mainFrame.setVisible(true);
+        });
+    }
+
+    private static void runAutomatedSelfTest() {
+        System.out.println("=== ATM Machine Simulator — Automated End-to-End Verification ===");
+        System.out.println("Active JDBC Engine: " + DatabaseConnection.getActiveEngineDescription());
+
+        ATMController controller = new ATMController();
+
+        OperationResult loginRes = controller.login("1001001", "1234");
+        assertCondition(loginRes.success(), "Login with valid credentials (1001001 / 1234): " + loginRes.message());
+
+        OperationResult badLogin = controller.login("1001001", "0000");
+        assertCondition(!badLogin.success(), "Reject invalid PIN (0000): " + badLogin.message());
+
+        controller.login("1001001", "1234");
+        double startBal = controller.getCurrentUser().getBalance();
+
+        OperationResult depRes = controller.deposit(1500.00);
+        assertCondition(depRes.success() && Math.abs(depRes.updatedBalance() - (startBal + 1500.00)) < 0.01,
+                "Cash Deposit ($1,500.00): " + depRes.message());
+
+        OperationResult witRes = controller.withdraw(500.00);
+        assertCondition(witRes.success() && Math.abs(witRes.updatedBalance() - (startBal + 1000.00)) < 0.01,
+                "Cash Withdrawal ($500.00): " + witRes.message());
+
+        OperationResult overWithdraw = controller.withdraw(999999.00);
+        assertCondition(!overWithdraw.success(), "Reject excessive withdrawal: " + overWithdraw.message());
+
+        OperationResult tfRes = controller.transferFunds("1001002", 1000.00);
+        assertCondition(tfRes.success() && Math.abs(tfRes.updatedBalance() - startBal) < 0.01,
+                "Fund Transfer ($1,000.00 -> 1001002): " + tfRes.message());
+
+        List<Transaction> statement = controller.getMiniStatement(10);
+        assertCondition(statement.size() >= 3,
+                "Mini Statement retrieved " + statement.size() + " recent transactions.");
+
+        OperationResult pinChange = controller.changePin("1234", "5678", "5678");
+        assertCondition(pinChange.success(), "PIN Change (1234 -> 5678): " + pinChange.message());
+
+        OperationResult restorePin = controller.changePin("5678", "1234", "1234");
+        assertCondition(restorePin.success(), "PIN Restore (5678 -> 1234): " + restorePin.message());
+
+        System.out.println("=== ALL ATM MVC + JDBC SELF-TESTS PASSED SUCCESSFULLY ===");
+    }
+
+    private static void assertCondition(boolean condition, String detail) {
+        if (!condition) {
+            throw new IllegalStateException("TEST FAILED: " + detail);
+        }
+        System.out.println("  [PASS] " + detail);
+    }
+}
+
+package com.atm.dao;
+
+import com.atm.util.SecurityUtil;
+
+import java.sql.*;
+
+public final class DatabaseConnection {
+
+    private static final String DEFAULT_SQLITE_URL = "jdbc:sqlite:atm_simulator.db";
+    private static String activeEngineDescription = "Initializing...";
+    private static boolean useEmbeddedDriver = false;
+
+    private DatabaseConnection() {
+    }
+
+    public static Connection getConnection() throws SQLException {
+        if (useEmbeddedDriver) {
+            return EmbeddedJdbcDriver.createConnection();
+        }
+
+        String customUrl = getConfig("ATM_DB_URL", null);
+        if (customUrl != null && !customUrl.isBlank()) {
+            String user = getConfig("ATM_DB_USER", "root");
+            String pass = getConfig("ATM_DB_PASS", "");
+            activeEngineDescription = customUrl.startsWith("jdbc:mysql") ? "MySQL JDBC" : "Custom JDBC";
+            return DriverManager.getConnection(customUrl, user, pass);
+        }
+
+        try {
+            Class.forName("org.sqlite.JDBC");
+            activeEngineDescription = "SQLite JDBC (atm_simulator.db)";
+            return DriverManager.getConnection(DEFAULT_SQLITE_URL);
+        } catch (ClassNotFoundException e) {
+            useEmbeddedDriver = true;
+            activeEngineDescription = "Embedded JDBC Store (atm_embedded_store.db)";
+            return EmbeddedJdbcDriver.createConnection();
+        }
+    }
+
+    public static String getActiveEngineDescription() {
+        return activeEngineDescription;
+    }
+
+    public static void initializeDatabase() {
+        String createUsersSql = """
+                CREATE TABLE IF NOT EXISTS users (
+                    account_number VARCHAR(20) PRIMARY KEY,
+                    pin VARCHAR(128) NOT NULL,
+                    holder_name VARCHAR(100) NOT NULL,
+                    account_type VARCHAR(20) NOT NULL,
+                    balance DOUBLE NOT NULL DEFAULT 0.0
+                )
+                """;
+
+        try (Connection conn = getConnection();
+             Statement stmt = conn.createStatement()) {
+
+            boolean isMySql = activeEngineDescription.contains("MySQL");
+            String createTransactionsSql = isMySql
+                    ? """
+                    CREATE TABLE IF NOT EXISTS transactions (
+                        transaction_id INT PRIMARY KEY AUTO_INCREMENT,
+                        account_number VARCHAR(20) NOT NULL,
+                        transaction_type VARCHAR(30) NOT NULL,
+                        amount DOUBLE NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        running_balance DOUBLE NOT NULL,
+                        description VARCHAR(255),
+                        FOREIGN KEY (account_number) REFERENCES users(account_number) ON DELETE CASCADE
+                    )
+                    """
+                    : """
+                    CREATE TABLE IF NOT EXISTS transactions (
+                        transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        account_number VARCHAR(20) NOT NULL,
+                        transaction_type VARCHAR(30) NOT NULL,
+                        amount DOUBLE NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        running_balance DOUBLE NOT NULL,
+                        description VARCHAR(255),
+                        FOREIGN KEY (account_number) REFERENCES users(account_number) ON DELETE CASCADE
+                    )
+                    """;
+
+            stmt.execute(createUsersSql);
+            stmt.execute(createTransactionsSql);
+
+            seedInitialDataIfNeeded(conn);
+
+        } catch (SQLException e) {
+            System.err.println("[DatabaseConnection] Error initializing schema: " + e.getMessage());
+        }
+    }
+
+    private static void seedInitialDataIfNeeded(Connection conn) throws SQLException {
+        String countSql = "SELECT COUNT(*) FROM users";
+        try (Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(countSql)) {
+            if (rs.next() && rs.getInt(1) > 0) {
+                return;
+            }
+        }
+
+        String insertUserSql = "INSERT INTO users (account_number, pin, holder_name, account_type, balance) VALUES (?, ?, ?, ?, ?)";
+        String insertTxSql = "INSERT INTO transactions (account_number, transaction_type, amount, running_balance, description) VALUES (?, ?, ?, ?, ?)";
+
+        Object[][] demoUsers = {
+                {"1001001", "1234", "Aarav Sharma", "Savings", 25000.00},
+                {"1001002", "4321", "Priya Patel", "Current", 68450.50},
+                {"1001003", "9999", "Rohan Verma", "Savings", 12300.00}
+        };
+
+        try (PreparedStatement userPs = conn.prepareStatement(insertUserSql);
+             PreparedStatement txPs = conn.prepareStatement(insertTxSql)) {
+
+            for (Object[] u : demoUsers) {
+                String accNo = (String) u[0];
+                String rawPin = (String) u[1];
+                String name = (String) u[2];
+                String type = (String) u[3];
+                double openingBal = (Double) u[4];
+
+                userPs.setString(1, accNo);
+                userPs.setString(2, SecurityUtil.hashPin(rawPin));
+                userPs.setString(3, name);
+                userPs.setString(4, type);
+                userPs.setDouble(5, openingBal);
+                userPs.executeUpdate();
+
+                txPs.setString(1, accNo);
+                txPs.setString(2, "Deposit");
+                txPs.setDouble(3, openingBal);
+                txPs.setDouble(4, openingBal);
+                txPs.setString(5, "Initial Account Opening Deposit");
+                txPs.executeUpdate();
+            }
+        }
+    }
+
+    private static String getConfig(String key, String defaultValue) {
+        String prop = System.getProperty(key);
+        if (prop != null && !prop.isBlank()) {
+            return prop;
+        }
+        String env = System.getenv(key);
+        if (env != null && !env.isBlank()) {
+            return env;
+        }
+        return defaultValue;
+    }
+}

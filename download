@@ -1,0 +1,15 @@
+# Compiled class output
+out/
+target/
+*.class
+
+# Local embedded database stores
+*.db
+*.db-journal
+*.db-wal
+
+# OS and IDE files
+.DS_Store
+.idea/
+.vscode/
+*.iml
